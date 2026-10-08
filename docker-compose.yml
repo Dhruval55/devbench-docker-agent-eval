@@ -1,0 +1,9 @@
+services:
+  benchmark:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python evaluation/run_benchmark.py --agent mock
+    volumes:
+      - ./trajectories:/app/trajectories
+
