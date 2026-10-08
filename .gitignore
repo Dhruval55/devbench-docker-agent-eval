@@ -6,6 +6,7 @@ __pycache__/
 .venv/
 venv/
 .env
+.tmp/
 benchmark_report.json
 BENCHMARK_REPORT.md
 trajectories/

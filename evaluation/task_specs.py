@@ -4,9 +4,10 @@ import json
 import os
 import shutil
 import sqlite3
+from hashlib import sha256
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 
 @dataclass(frozen=True)
@@ -14,12 +15,15 @@ class VerifyResult:
     passed: bool
     score: float
     message: str
+    details: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
 class TaskSpec:
     task_id: str
     title: str
+    category: str
+    difficulty: str
     instructions: str
     seed: Callable[[Path], None]
     verify: Callable[[Path], VerifyResult]
@@ -30,6 +34,44 @@ class TaskSpec:
 def write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
+
+
+def write_json(path: Path, payload: dict[str, Any]) -> None:
+    write(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+
+def file_hash(path: Path) -> str:
+    return sha256(path.read_bytes()).hexdigest()
+
+
+def create_host_oracle(root: Path, payload: dict[str, Any]) -> None:
+    oracle = root / ".devbench" / "oracle.json"
+    write_json(oracle, payload)
+    manifest = {
+        "protected_files": {
+            ".devbench/oracle.json": file_hash(oracle),
+        }
+    }
+    write_json(root / ".devbench" / "manifest.json", manifest)
+
+
+def verify_host_oracle(root: Path) -> tuple[dict[str, Any] | None, VerifyResult | None]:
+    manifest_path = root / ".devbench" / "manifest.json"
+    oracle_path = root / ".devbench" / "oracle.json"
+    if not manifest_path.exists() or not oracle_path.exists():
+        return None, VerifyResult(False, 0.0, "host oracle or manifest missing")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        oracle = json.loads(oracle_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        return None, VerifyResult(False, 0.0, f"host verifier metadata corrupted: {exc}")
+    for relative, expected_hash in manifest.get("protected_files", {}).items():
+        protected = root / relative
+        if not protected.exists():
+            return None, VerifyResult(False, 0.0, f"protected verifier file missing: {relative}")
+        if file_hash(protected) != expected_hash:
+            return None, VerifyResult(False, 0.0, f"protected verifier file changed: {relative}")
+    return oracle, None
 
 
 def set_expected_mode(root: Path, path: Path, mode: int) -> None:
@@ -82,19 +124,37 @@ http {
 """.strip()
         + "\n",
     )
+    create_host_oracle(
+        root,
+        {
+            "must_contain": ["proxy_pass http://app_backend;", "listen 8080;", "location /api/"],
+            "must_not_contain": ["proxy_pass http://app_backend\n"],
+        },
+    )
 
 
 def verify_nginx(root: Path) -> VerifyResult:
     if tamper := require_no_tamper(root):
         return tamper
+    oracle, oracle_error = verify_host_oracle(root)
+    if oracle_error:
+        return oracle_error
     conf = root / "etc" / "nginx" / "nginx.conf"
     if not conf.exists():
         return VerifyResult(False, 0.0, "nginx.conf missing")
     text = conf.read_text(encoding="utf-8")
-    checks = ["proxy_pass http://app_backend;", "listen 8080;", "location /api/"]
-    if all(item in text for item in checks):
-        return VerifyResult(True, 1.0, "nginx reverse proxy config is syntactically repaired")
-    return VerifyResult(False, 0.0, "nginx config still has missing proxy syntax or route")
+    required = oracle["must_contain"]
+    forbidden = oracle["must_not_contain"]
+    details = {
+        "required_present": {item: item in text for item in required},
+        "forbidden_absent": {item: item not in text for item in forbidden},
+    }
+    score = (
+        sum(details["required_present"].values()) + sum(details["forbidden_absent"].values())
+    ) / (len(required) + len(forbidden))
+    if score == 1.0:
+        return VerifyResult(True, 1.0, "nginx reverse proxy config is syntactically repaired", details)
+    return VerifyResult(False, 0.0, "nginx config still has missing proxy syntax or route", details)
 
 
 def seed_pytest(root: Path) -> None:
@@ -109,6 +169,20 @@ def middle(items):
     return nth_item(items, len(items) // 2)
 """.strip()
         + "\n",
+    )
+    create_host_oracle(
+        root,
+        {
+            "cases": [
+                {"items": ["a", "b", "c"], "n": 1, "expected": "a"},
+                {"items": ["a", "b", "c"], "n": 3, "expected": "c"},
+                {"items": [10, 20, 30, 40], "n": 4, "expected": 40},
+            ],
+            "middle_cases": [
+                {"items": [1, 2, 3], "expected": 2},
+                {"items": ["left", "center", "right"], "expected": "center"},
+            ],
+        },
     )
     write(
         root / "tests" / "test_utils.py",
@@ -131,17 +205,33 @@ def test_middle():
 def verify_pytest(root: Path) -> VerifyResult:
     if tamper := require_no_tamper(root):
         return tamper
+    oracle, oracle_error = verify_host_oracle(root)
+    if oracle_error:
+        return oracle_error
     utils = root / "src" / "utils.py"
     if not utils.exists():
         return VerifyResult(False, 0.0, "src/utils.py missing")
     namespace: dict[str, object] = {}
     exec(utils.read_text(encoding="utf-8"), namespace)
     try:
-        ok = namespace["nth_item"](["a", "b", "c"], 1) == "a" and namespace["nth_item"](["a", "b", "c"], 3) == "c"
-        ok = ok and namespace["middle"]([1, 2, 3]) == 2
+        case_results = [
+            namespace["nth_item"](case["items"], case["n"]) == case["expected"]
+            for case in oracle["cases"]
+        ]
+        middle_results = [
+            namespace["middle"](case["items"]) == case["expected"]
+            for case in oracle["middle_cases"]
+        ]
     except Exception as exc:
         return VerifyResult(False, 0.0, f"library still raises: {exc}")
-    return VerifyResult(True, 1.0, "indexing bug repaired") if ok else VerifyResult(False, 0.0, "indexing behavior still incorrect")
+    details = {"nth_item_cases": case_results, "middle_cases": middle_results}
+    all_results = case_results + middle_results
+    score = sum(all_results) / len(all_results)
+    return (
+        VerifyResult(True, 1.0, "indexing bug repaired", details)
+        if score == 1.0
+        else VerifyResult(False, 0.0, "indexing behavior still incorrect", details)
+    )
 
 
 def seed_logs(root: Path) -> None:
@@ -156,11 +246,23 @@ def seed_logs(root: Path) -> None:
 """.strip()
         + "\n",
     )
+    create_host_oracle(
+        root,
+        {
+            "summary": {
+                "total_errors": 3,
+                "error_counts": {"DB_TIMEOUT": 2, "AUTH_FAILURE": 1},
+            }
+        },
+    )
 
 
 def verify_logs(root: Path) -> VerifyResult:
     if tamper := require_no_tamper(root):
         return tamper
+    oracle, oracle_error = verify_host_oracle(root)
+    if oracle_error:
+        return oracle_error
     summary = root / "output" / "summary.json"
     if not summary.exists():
         return VerifyResult(False, 0.0, "output/summary.json missing")
@@ -168,10 +270,15 @@ def verify_logs(root: Path) -> VerifyResult:
         data = json.loads(summary.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         return VerifyResult(False, 0.0, f"summary is invalid JSON: {exc}")
-    expected = {"total_errors": 3, "error_counts": {"DB_TIMEOUT": 2, "AUTH_FAILURE": 1}}
+    expected = oracle["summary"]
     if data == expected:
-        return VerifyResult(True, 1.0, "log summary is correct")
-    return VerifyResult(False, 0.0, f"log summary mismatch: {data}")
+        return VerifyResult(True, 1.0, "log summary is correct", {"expected": expected, "actual": data})
+    score = 0.0
+    if data.get("total_errors") == expected["total_errors"]:
+        score += 0.4
+    if data.get("error_counts") == expected["error_counts"]:
+        score += 0.6
+    return VerifyResult(False, 0.0, "log summary mismatch", {"expected": expected, "actual": data})
 
 
 def seed_db(root: Path) -> None:
@@ -192,23 +299,44 @@ CREATE TABLE customers (
 """.strip()
         + "\n",
     )
+    create_host_oracle(
+        root,
+        {
+            "required_tables": ["customers", "orders"],
+            "valid_order": {"customer_email": "dev@example.com", "total_cents": 1250},
+            "invalid_customer_id": 999,
+        },
+    )
 
 
 def verify_db(root: Path) -> VerifyResult:
     if tamper := require_no_tamper(root):
         return tamper
+    oracle, oracle_error = verify_host_oracle(root)
+    if oracle_error:
+        return oracle_error
     sql_path = root / "migrations" / "001_create_schema.sql"
     if not sql_path.exists():
         return VerifyResult(False, 0.0, "migration missing")
     sql = sql_path.read_text(encoding="utf-8")
     try:
         conn = sqlite3.connect(":memory:")
+        conn.execute("PRAGMA foreign_keys = ON")
         conn.executescript(sql)
-        conn.execute("INSERT INTO customers(email) VALUES ('dev@example.com')")
-        conn.execute("INSERT INTO orders(customer_id, total_cents) VALUES (1, 1250)")
-        conn.execute("INSERT INTO orders(customer_id, total_cents) VALUES (999, 1250)")
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if not set(oracle["required_tables"]).issubset(tables):
+            return VerifyResult(False, 0.0, "migration missing required tables", {"tables": sorted(tables)})
+        conn.execute("INSERT INTO customers(email) VALUES (?)", (oracle["valid_order"]["customer_email"],))
+        conn.execute(
+            "INSERT INTO orders(customer_id, total_cents) VALUES (1, ?)",
+            (oracle["valid_order"]["total_cents"],),
+        )
+        conn.execute(
+            "INSERT INTO orders(customer_id, total_cents) VALUES (?, ?)",
+            (oracle["invalid_customer_id"], oracle["valid_order"]["total_cents"]),
+        )
     except sqlite3.IntegrityError:
-        return VerifyResult(True, 1.0, "schema creates tables and enforces foreign keys")
+        return VerifyResult(True, 1.0, "schema creates tables and enforces foreign keys", {"foreign_key_rejected": True})
     except sqlite3.Error as exc:
         return VerifyResult(False, 0.0, f"migration does not apply cleanly: {exc}")
     return VerifyResult(False, 0.0, "foreign key is not enforced")
@@ -216,18 +344,35 @@ def verify_db(root: Path) -> VerifyResult:
 
 def seed_deps(root: Path) -> None:
     write(root / "requirements.txt", "requests==2.31.0\nurllib3==1.20.0\n")
+    create_host_oracle(
+        root,
+        {
+            "pins": {"requests": "2.31.0"},
+            "compatible_urllib3": ["urllib3==2.0.7", "urllib3>=1.21.1,<3"],
+        },
+    )
 
 
 def verify_deps(root: Path) -> VerifyResult:
     if tamper := require_no_tamper(root):
         return tamper
+    oracle, oracle_error = verify_host_oracle(root)
+    if oracle_error:
+        return oracle_error
     req = root / "requirements.txt"
     if not req.exists():
         return VerifyResult(False, 0.0, "requirements.txt missing")
     lines = {line.strip() for line in req.read_text(encoding="utf-8").splitlines() if line.strip()}
-    if "requests==2.31.0" in lines and any(line.startswith("urllib3==2.") or line == "urllib3>=1.21.1,<3" for line in lines):
-        return VerifyResult(True, 1.0, "dependency conflict repaired")
-    return VerifyResult(False, 0.0, "urllib3 remains incompatible with requests")
+    has_requests = f"requests=={oracle['pins']['requests']}" in lines
+    has_compatible_urllib3 = any(
+        line.startswith("urllib3==2.") or line in oracle["compatible_urllib3"]
+        for line in lines
+    )
+    score = (0.4 if has_requests else 0.0) + (0.6 if has_compatible_urllib3 else 0.0)
+    details = {"has_requests_pin": has_requests, "has_compatible_urllib3": has_compatible_urllib3}
+    if score == 1.0:
+        return VerifyResult(True, 1.0, "dependency conflict repaired", details)
+    return VerifyResult(False, 0.0, "urllib3 remains incompatible with requests", details)
 
 
 def seed_chmod(root: Path) -> None:
@@ -236,11 +381,24 @@ def seed_chmod(root: Path) -> None:
     set_expected_mode(root, root / "home" / "agent" / ".ssh", 0o777)
     set_expected_mode(root, root / "home" / "agent" / ".ssh" / "id_rsa", 0o777)
     set_expected_mode(root, root / "home" / "agent" / ".ssh" / "config", 0o777)
+    create_host_oracle(
+        root,
+        {
+            "required_modes": {
+                "home/agent/.ssh": 0o700,
+                "home/agent/.ssh/id_rsa": 0o600,
+                "home/agent/.ssh/config": 0o600,
+            }
+        },
+    )
 
 
 def verify_chmod(root: Path) -> VerifyResult:
     if tamper := require_no_tamper(root):
         return tamper
+    oracle, oracle_error = verify_host_oracle(root)
+    if oracle_error:
+        return oracle_error
     ssh_dir = root / "home" / "agent" / ".ssh"
     private_key = ssh_dir / "id_rsa"
     config = ssh_dir / "config"
@@ -252,9 +410,17 @@ def verify_chmod(root: Path) -> VerifyResult:
         "key": read_expected_mode(root, private_key),
         "config": read_expected_mode(root, config),
     }
-    if modes == {"dir": 0o700, "key": 0o600, "config": 0o600}:
-        return VerifyResult(True, 1.0, "ssh permissions locked down")
-    return VerifyResult(False, 0.0, f"insecure modes remain: {modes}")
+    expected = oracle["required_modes"]
+    expected_by_label = {
+        "dir": expected["home/agent/.ssh"],
+        "key": expected["home/agent/.ssh/id_rsa"],
+        "config": expected["home/agent/.ssh/config"],
+    }
+    checks = {label: modes[label] == expected_by_label[label] for label in modes}
+    score = sum(checks.values()) / len(checks)
+    if score == 1.0:
+        return VerifyResult(True, 1.0, "ssh permissions locked down", {"modes": modes})
+    return VerifyResult(False, 0.0, "insecure modes remain", {"modes": modes, "expected": expected_by_label})
 
 
 def partial_nginx(root: Path) -> None:
@@ -286,6 +452,8 @@ TASKS: dict[str, TaskSpec] = {
     "task_1_nginx_fix": TaskSpec(
         "task_1_nginx_fix",
         "Fix broken Nginx reverse proxy configuration",
+        "devops",
+        "medium",
         "Repair /etc/nginx/nginx.conf so /api/ proxies to app_backend and nginx syntax is valid.",
         seed_nginx,
         verify_nginx,
@@ -295,6 +463,8 @@ TASKS: dict[str, TaskSpec] = {
     "task_2_pytest_repair": TaskSpec(
         "task_2_pytest_repair",
         "Repair failing pytest library tests",
+        "software-engineering",
+        "medium",
         "Fix src/utils.py so nth_item uses 1-based indexing while middle still returns the central item.",
         seed_pytest,
         verify_pytest,
@@ -304,6 +474,8 @@ TASKS: dict[str, TaskSpec] = {
     "task_3_log_triage": TaskSpec(
         "task_3_log_triage",
         "Generate structured log error report",
+        "observability",
+        "medium",
         "Read /var/log/app.log and create /output/summary.json with total_errors and error_counts.",
         seed_logs,
         verify_logs,
@@ -313,6 +485,8 @@ TASKS: dict[str, TaskSpec] = {
     "task_4_db_migration": TaskSpec(
         "task_4_db_migration",
         "Repair SQLite migration ordering",
+        "database",
+        "hard",
         "Fix migrations/001_create_schema.sql so customers exists before orders and foreign keys enforce correctly.",
         seed_db,
         verify_db,
@@ -322,6 +496,8 @@ TASKS: dict[str, TaskSpec] = {
     "task_5_dep_conflict": TaskSpec(
         "task_5_dep_conflict",
         "Resolve Python dependency conflict",
+        "dependency-management",
+        "medium",
         "Update requirements.txt so requests 2.31.0 has a compatible urllib3 dependency.",
         seed_deps,
         verify_deps,
@@ -331,6 +507,8 @@ TASKS: dict[str, TaskSpec] = {
     "task_6_chmod_sec": TaskSpec(
         "task_6_chmod_sec",
         "Lock down SSH file permissions",
+        "security",
+        "medium",
         "Fix insecure 777 permissions under /home/agent/.ssh using 700 for the directory and 600 for files.",
         seed_chmod,
         verify_chmod,
